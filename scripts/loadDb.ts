@@ -8,6 +8,7 @@ import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import OpenAI from "openai";
 
 import 'dotenv/config'
+import { PuppeteerWebBaseLoader } from "@langchain/community/document_loaders/web/puppeteer";
 
 type similarityMetric = "cosine" | "euclidean" | "dot_product";
 
@@ -38,6 +39,8 @@ const splitter = new RecursiveCharacterTextSplitter({
     chunkOverlap: 100,
 })
 
+const batchSize = 32;
+
 const createCollection = async (similarityMetric: similarityMetric = 'dot_product') => {
     const res = await db.createCollection(ASTRA_DB_COLLECTION, {
         vector: {
@@ -55,26 +58,55 @@ const loadSampleData = async () => {
         const content = await scrapePage(url);
 
         const chunks = await splitter.splitText(content);
-        for await (const chunk of chunks) {
+        for (let batchStart = 0; batchStart < chunks.length; batchStart += batchSize) {
+            const chunkBatch = chunks.slice(batchStart, batchStart + batchSize);
             const embedding = await openai.embeddings.create({
                 model: "text-embedding-3-small",
-                input: chunk,
+                input: chunkBatch,
                 encoding_format: "float",
-            })
+            });
 
-            const vector = embedding.data[0].embedding;
+            const embeddingsByIndex = new Map(
+                embedding.data.map(({ index, embedding }) => [index, embedding]),
+            );
+            const documents = chunkBatch.map((text, index) => {
+                const vector = embeddingsByIndex.get(index);
+                if (!vector) {
+                    throw new Error(`Missing embedding for chunk ${batchStart + index} from ${url}`);
+                }
 
-            const res = await collection.insertOne({
-                $vector: vector,
-                text: chunk,
-            })
+                return { $vector: vector, text };
+            });
 
-            console.log("=========res", res)
+            const result = await collection.insertMany(documents, {
+                concurrency: 2,
+                timeout: {
+                    requestTimeoutMs: 60_000,
+                    generalMethodTimeoutMs: 120_000,
+                },
+            });
+            console.log(`Inserted ${result.insertedCount} chunks from ${url}`);
         }
         
     }
 }
 
 const scrapePage = async (url: string) => {
-    return `Sample content for ${url}`;
+   const loader =  new PuppeteerWebBaseLoader(url, {
+        launchOptions: {
+            headless: true,
+        },
+
+        gotoOptions: {
+            waitUntil: 'domcontentloaded',
+        },
+        evaluate: async (page, browser) => {
+          const result =   await page.evaluate(() => document.body.innerHTML)
+          await browser.close();
+          return result;
+        }
+    })
+    return (await loader.scrape())?.replace(/<[^>]*>?/gm, '')
 }
+
+createCollection().then(() => loadSampleData());
